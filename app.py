@@ -13,18 +13,20 @@ run_state = {
     "last_result": None,
     "last_error": None,
     "dry_run": None,
+    "progress": None,
 }
 
 def run_in_background(dry_run):
     run_state["status"] = "running"
     run_state["last_run"] = datetime.utcnow().isoformat()
     run_state["dry_run"] = dry_run
+    run_state["progress"] = {"phase": "starting", "merges_done": 0, "merges_failed": 0, "total_to_merge": 0}
     try:
-        result = run_dedup(dry_run=dry_run)
-        # Don't store full details in state (too large), just summary
+        result = run_dedup(dry_run=dry_run, progress=run_state["progress"])
         run_state["status"] = "success"
         run_state["last_result"] = {k: v for k, v in result.items() if k != "details"}
         run_state["last_error"] = None
+        run_state["progress"] = None
     except Exception as e:
         run_state["status"] = "error"
         run_state["last_error"] = traceback.format_exc()

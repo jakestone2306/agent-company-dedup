@@ -8,7 +8,6 @@ Company Deduplication Agent
 
 import os
 import time
-import json
 import requests
 from collections import defaultdict
 
@@ -21,16 +20,10 @@ def hs_get(path, params=None):
     r.raise_for_status()
     return r.json()
 
-def hs_post(path, payload):
-    r = requests.post(f"{BASE}{path}", headers=HEADERS, json=payload)
-    r.raise_for_status()
-    return r.json()
-
-# ── Fetch all companies ────────────────────────────────────────────────────────
-
-def fetch_all_companies():
-    """Page through ALL companies using GET endpoint (no 10k search limit)."""
+def fetch_all_companies(progress=None):
     print("📥 Fetching all companies...")
+    if progress:
+        progress["phase"] = "fetching_companies"
     companies = []
     after = None
     page = 0
@@ -48,6 +41,8 @@ def fetch_all_companies():
 
         if page % 10 == 0:
             print(f"  ...fetched {len(companies)} companies so far")
+            if progress:
+                progress["companies_fetched"] = len(companies)
 
         after = data.get("paging", {}).get("next", {}).get("after")
         if not after:
@@ -58,20 +53,15 @@ def fetch_all_companies():
     print(f"✅ Fetched {len(companies)} total companies")
     return companies
 
-# ── Find duplicates ────────────────────────────────────────────────────────────
-
 SKIP_DOMAINS = {
     "", "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
     "aol.com", "icloud.com", "mail.com", "protonmail.com",
 }
 
 def find_duplicates(companies):
-    """Group companies by domain, return groups with 2+ companies."""
     by_domain = defaultdict(list)
-
     for c in companies:
         domain = (c["properties"].get("domain") or "").strip().lower()
-        # Strip protocol/www
         domain = domain.replace("https://", "").replace("http://", "").lstrip("www.").rstrip("/")
         if not domain or domain in SKIP_DOMAINS:
             continue
@@ -81,29 +71,15 @@ def find_duplicates(companies):
     print(f"🔍 Found {len(duplicates)} domains with duplicate companies")
     return duplicates
 
-# ── Pick primary record ────────────────────────────────────────────────────────
-
 def pick_primary(companies):
-    """
-    Primary = most contacts + deals.
-    Tiebreak: oldest record (lowest createdate).
-    """
     def score(c):
         contacts = int(c["properties"].get("num_associated_contacts") or 0)
         deals    = int(c["properties"].get("num_associated_deals") or 0)
         created  = c["properties"].get("createdate") or "9999"
         return (contacts + deals, -int(created[:10].replace("-", "") or 0))
-
     return max(companies, key=score)
 
-# ── Merge ──────────────────────────────────────────────────────────────────────
-
 def merge_companies(primary_id, secondary_id):
-    """
-    Call HubSpot's native merge endpoint.
-    All notes, activity, deals, contacts roll up to primary_id.
-    secondary_id is archived after merge.
-    """
     r = requests.post(
         f"{BASE}/crm/v3/objects/companies/merge",
         headers=HEADERS,
@@ -112,9 +88,7 @@ def merge_companies(primary_id, secondary_id):
     r.raise_for_status()
     return r.json()
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-def run_dedup(dry_run=False):
+def run_dedup(dry_run=False, progress=None):
     stats = {
         "total_companies": 0,
         "duplicate_domains": 0,
@@ -124,30 +98,30 @@ def run_dedup(dry_run=False):
         "details": [],
     }
 
-    companies = fetch_all_companies()
+    companies = fetch_all_companies(progress=progress)
     stats["total_companies"] = len(companies)
 
     duplicates = find_duplicates(companies)
     stats["duplicate_domains"] = len(duplicates)
 
-    print(f"\n{'🔍 DRY RUN — no changes will be made' if dry_run else '🔀 Starting merges...'}\n")
+    # Count total merges needed
+    total_merges = sum(len(group) - 1 for group in duplicates.values())
+    if progress:
+        progress["phase"] = "merging" if not dry_run else "dry_run"
+        progress["total_to_merge"] = total_merges
+
+    print(f"\n{'🔍 DRY RUN — no changes will be made' if dry_run else '🔀 Starting merges...'}  ({total_merges} total)\n")
 
     for domain, group in duplicates.items():
-        primary   = pick_primary(group)
+        primary    = pick_primary(group)
         secondaries = [c for c in group if c["id"] != primary["id"]]
 
-        primary_name = primary["properties"].get("name", "Unnamed")
+        primary_name     = primary["properties"].get("name", "Unnamed")
         primary_contacts = int(primary["properties"].get("num_associated_contacts") or 0)
         primary_deals    = int(primary["properties"].get("num_associated_deals") or 0)
 
-        print(f"\n📎 {domain} ({len(group)} records)")
-        print(f"  PRIMARY: {primary_name} (id={primary['id']}, contacts={primary_contacts}, deals={primary_deals})")
-
         for sec in secondaries:
             sec_name = sec["properties"].get("name", "Unnamed")
-            sec_contacts = int(sec["properties"].get("num_associated_contacts") or 0)
-            sec_deals    = int(sec["properties"].get("num_associated_deals") or 0)
-            print(f"  MERGE ←  {sec_name} (id={sec['id']}, contacts={sec_contacts}, deals={sec_deals})")
 
             detail = {
                 "domain": domain,
@@ -166,10 +140,14 @@ def run_dedup(dry_run=False):
                     merge_companies(primary["id"], sec["id"])
                     detail["status"] = "merged"
                     stats["merges_performed"] += 1
-                    time.sleep(0.2)  # be gentle with the API
+                    if progress:
+                        progress["merges_done"] = stats["merges_performed"]
+                    time.sleep(0.2)
                 except Exception as e:
                     detail["status"] = f"error: {e}"
                     stats["merges_failed"] += 1
+                    if progress:
+                        progress["merges_failed"] = stats["merges_failed"]
                     print(f"  ⚠️  Merge failed: {e}")
 
             stats["details"].append(detail)
